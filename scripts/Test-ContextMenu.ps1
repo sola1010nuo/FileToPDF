@@ -1,152 +1,127 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding()]
 param()
-
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = Split-Path $PSScriptRoot -Parent
+. "$PSScriptRoot\ContextMenu.Common.ps1"
+function Assert-True([bool]$Condition, [string]$Message) { if (!$Condition) { throw "FAIL: $Message" } }
+$previous = Get-MenuSettings
 $exe = Join-Path $root 'publish\win-x64\FileToPDF.exe'
-if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Run scripts/Publish.ps1 first.' }
-
-function Assert-True([bool]$Condition, [string]$Message) {
-    if (!$Condition) { throw "FAIL: $Message" }
-}
-
-# Preserve any pre-existing installation, including registry value kinds and subkeys.
-function Read-Key([Microsoft.Win32.RegistryKey]$Key) {
-    if ($null -eq $Key) { return $null }
-    $node = @{ Values = @(); Children = @{} }
-    foreach ($name in $Key.GetValueNames()) {
-        $node.Values += @{ Name = $name; Data = $Key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames); Kind = $Key.GetValueKind($name) }
-    }
-    foreach ($name in $Key.GetSubKeyNames()) {
-        $child = $Key.OpenSubKey($name)
-        try { $node.Children[$name] = Read-Key $child } finally { $child.Dispose() }
-    }
-    return $node
-}
-function Write-Key([Microsoft.Win32.RegistryKey]$Key, $Node) {
-    foreach ($value in $Node.Values) { $Key.SetValue($value.Name, $value.Data, $value.Kind) }
-    foreach ($name in $Node.Children.Keys) {
-        $child = $Key.CreateSubKey($name)
-        try { Write-Key $child $Node.Children[$name] } finally { $child.Dispose() }
-    }
-}
-
-$extensions = @('.doc', '.docx', '.ppt', '.pptx', '.jpg', '.jpeg', '.png')
-$backups = @{}
-foreach ($extension in $extensions) {
-    $path = "Software\Classes\SystemFileAssociations\$extension\shell\FileToPDF.ConvertToPdf"
-    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($path)
-    try { $backups[$path] = Read-Key $key } finally { if ($null -ne $key) { $key.Dispose() } }
-}
-
-$tag = 'FileToPDF-context-' + [Guid]::NewGuid().ToString('N')
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+& (Join-Path $vs 'MSBuild\Current\Bin\MSBuild.exe') (Join-Path $root 'tests\FileToPDF.ShellExtension.Tests\FileToPDF.ShellExtension.Tests.vcxproj') /nologo /verbosity:minimal /p:Configuration=Release /p:Platform=x64
+if ($LASTEXITCODE -ne 0) { throw 'Native tests build failed.' }
+$runner = Join-Path $root 'artifacts\native\Release\FileToPDF.ShellExtension.Tests.exe'
+$dll = Join-Path $root 'publish\shell-integration\FileToPDF.ShellExtension.dll'
+& $runner --unit $dll
+if ($LASTEXITCODE -ne 0) { throw 'Native unit tests failed.' }
+$tag = 'FileToPDF-modern-' + [Guid]::NewGuid().ToString('N')
 $work = Join-Path $root "artifacts\tests\$tag"
 [void][IO.Directory]::CreateDirectory($work)
-$desktop = [Environment]::GetFolderPath('DesktopDirectory')
+$exeDirectory = Join-Path $work 'EXE with spaces'
+[void][IO.Directory]::CreateDirectory($exeDirectory)
+$testExe = Join-Path $exeDirectory 'FileToPDF.exe'
+$probe = Join-Path $exeDirectory 'ArgumentProbe.exe'
+Copy-Item -LiteralPath $exe -Destination $testExe
+Copy-Item -LiteralPath $runner -Destination $probe
+$extensions = @('.doc', '.docx', '.ppt', '.pptx', '.jpg', '.jpeg', '.png')
+$fixtures = @('report.doc', 'report.docx', 'slides.ppt', 'slides.pptx', 'photo.jpg', 'photo.jpg', ([string][char]0x900F + [char]0x660E + ' image.png'))
+$selectedPaths = @()
 $outputs = @()
+$desktop = [Environment]::GetFolderPath('DesktopDirectory')
+for ($i=0; $i -lt $extensions.Count; $i++) {
+    $name = $tag + "-$i " + [char]0x6E2C + [char]0x8A66 + ' & (source) %1' + $extensions[$i]
+    $source = Join-Path $work $name
+    Copy-Item -LiteralPath (Join-Path $root "artifacts\tests\$($fixtures[$i])") -Destination $source
+    $selectedPaths += $source
+    $outputs += Join-Path $desktop ([IO.Path]::GetFileNameWithoutExtension($name) + '.pdf')
+}
+function Invoke-Native([string]$Action, [string]$Registration, [string[]]$Paths) {
+    $result = & $runner $Action $Registration @Paths
+    if ($LASTEXITCODE -ne 0) { throw "Native $Action failed: $result" }
+    return $result
+}
+function Set-TestTarget([string]$Path) {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($script:SettingsPath, $true)
+    try { $key.SetValue('ExePath', $Path) } finally { $key.Dispose() }
+}
+function Wait-File([string]$Path) {
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while (!(Test-Path -LiteralPath $Path) -and $timer.Elapsed.TotalSeconds -lt 210) { Start-Sleep -Milliseconds 250 }
+    Assert-True (Test-Path -LiteralPath $Path) "output exists: $Path"
+}
 $sentinelPath = "Software\Classes\SystemFileAssociations\.png\shell\$tag"
-$shell = $null
 try {
-    # Test executable path quoting as well as source path quoting.
-    $testExe = Join-Path $work 'File To PDF.exe'
-    Copy-Item -LiteralPath $exe -Destination $testExe
+    # Regression for $PSScriptRoot: no parameters, including when launched from another cwd.
+    Push-Location $env:TEMP
+    try { & "$PSScriptRoot\Install-ContextMenu.ps1" } finally { Pop-Location }
+    Assert-True ((Get-MenuSettings)['ExePath'] -ceq $exe) 'default executable path'
     & "$PSScriptRoot\Install-ContextMenu.ps1" -ExePath $testExe
-    & "$PSScriptRoot\Install-ContextMenu.ps1" -ExePath $testExe
-    $expected = '"{0}" "%1"' -f $testExe
-    foreach ($path in $backups.Keys) {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($path)
-        try {
-            Assert-True ($key.GetValue('') -ceq 'Convert to PDF') 'menu label'
-            Assert-True ($key.GetValue('MultiSelectModel') -ceq 'Single') 'single-source verb'
-            $commandKey = $key.OpenSubKey('command')
-            try { Assert-True ($commandKey.GetValue('') -ceq $expected) 'quoted EXE and source placeholder' }
-            finally { $commandKey.Dispose() }
-        }
+    Assert-True ((Get-MenuSettings)['ExePath'] -ceq $testExe) 'custom executable path'
+    Assert-True (@(Get-OwnedMenuPackages).Count -eq 1) 'one registered sparse identity package'
+    $reject = $false
+    try { & "$PSScriptRoot\Install-ContextMenu.ps1" -ExePath (Join-Path $work 'missing.exe') } catch { $reject = $true }
+    Assert-True $reject 'missing EXE rejected before installation'
+    Assert-True ((Get-MenuSettings)['ExePath'] -ceq $testExe) 'failed install preserves configuration'
+    Invoke-Native '--unit' 'registered' @()
+    foreach ($selectedPath in $selectedPaths) { Assert-True ((Invoke-Native '--state' 'registered' @($selectedPath)) -contains 'ENABLED') "supported: $selectedPath" }
+    foreach ($name in @('unsupported.pdf','unsupported.exe','unsupported.txt')) {
+        $unsupported = Join-Path $work $name
+        [IO.File]::WriteAllText($unsupported, 'test')
+        Assert-True ((Invoke-Native '--state' 'registered' @($unsupported)) -contains 'HIDDEN') "hidden: $name"
+        Assert-True ((Invoke-Native '--state' 'registered' @($selectedPaths[0],$unsupported)) -contains 'HIDDEN') 'mixed unsupported selection hidden'
+    }
+    $directory = Join-Path $work 'folder.png'
+    [void][IO.Directory]::CreateDirectory($directory)
+    Assert-True ((Invoke-Native '--state' 'registered' @($directory)) -contains 'HIDDEN') 'folder with supported suffix hidden'
+    Set-TestTarget $probe
+    Invoke-Native '--invoke' 'registered' $selectedPaths
+    $capture = Join-Path $exeDirectory 'arguments.bin'
+    Wait-File $capture
+    Start-Sleep -Milliseconds 500
+    $reader = New-Object IO.BinaryReader([IO.File]::OpenRead($capture), [Text.Encoding]::Unicode)
+    try {
+        Assert-True ($reader.ReadInt32() -eq $selectedPaths.Count + 1) 'all selected files passed in one argv'
+        foreach ($selectedPath in $selectedPaths) { $length = $reader.ReadInt32(); Assert-True ((-join $reader.ReadChars($length)) -ceq $selectedPath) 'exact Unicode/special-character argv' }
+    } finally { $reader.Dispose() }
+    Assert-True (@(Get-Content (Join-Path $exeDirectory 'invocations.txt')).Count -eq 1) 'exactly one process for multi-select'
+    Set-TestTarget $testExe
+    Invoke-Native '--invoke' 'registered' $selectedPaths
+    foreach ($output in $outputs) {
+        Wait-File $output
+        $stream = [IO.File]::OpenRead($output)
+        try { $header = New-Object byte[] 5; [void]$stream.Read($header,0,5); Assert-True ([Text.Encoding]::ASCII.GetString($header) -ceq '%PDF-') 'native selection produced PDF' }
+        finally { $stream.Dispose() }
+    }
+    Write-Output 'PASS: packaged COM activation; seven formats; unsupported selections hidden; exact multi-select argv; real Desktop PDFs'
+    # Exercise the Win10 registration on this OS without pretending this tests Win10 Explorer UI.
+    & "$PSScriptRoot\Install-ContextMenu.ps1" -ExePath $testExe -Mode Legacy
+    Assert-True (@(Get-OwnedMenuPackages).Count -eq 0) 'legacy installation has no Appx registration'
+    Invoke-Native '--unit' 'registered-legacy' @()
+    foreach ($extension in $extensions) {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\Classes\SystemFileAssociations\$extension\shell\FileToPDF.ConvertToPdf")
+        try { Assert-True ($key.GetValue('ExplorerCommandHandler') -eq $script:MenuClsid) 'legacy COM handler'; Assert-True ($key.GetValue('MultiSelectModel') -eq 'Player') 'legacy multi-select model' }
         finally { $key.Dispose() }
     }
-    $rejected = $false
-    try { & "$PSScriptRoot\Install-ContextMenu.ps1" -ExePath (Join-Path $work 'missing.exe') }
-    catch { $rejected = $true }
-    Assert-True $rejected 'missing executable rejected'
-    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Classes\SystemFileAssociations\.png\shell\FileToPDF.ConvertToPdf\command')
-    try { Assert-True ($key.GetValue('') -ceq $expected) 'invalid installation leaves existing command intact' }
-    finally { $key.Dispose() }
-
-    $shell = New-Object -ComObject Shell.Application
-    $folder = $shell.NameSpace($work)
-    $fixtures = @('report.doc', 'report.docx', 'slides.ppt', 'slides.pptx', 'photo.jpg', 'photo.jpg', ([string][char]0x900F + [char]0x660E + ' image.png'))
-    for ($i = 0; $i -lt $extensions.Count; $i++) {
-        $extension = $extensions[$i]
-        # Unicode, spaces, parentheses and shell metacharacters must remain one literal argument.
-        $name = $tag + ' ' + [char]0x6E2C + [char]0x8A66 + ' & (source)' + $extension
-        $source = Join-Path $work $name
-        Copy-Item -LiteralPath (Join-Path $root "artifacts\tests\$($fixtures[$i])") -Destination $source
-        # All seven files have the same stem, so resolve every subsequent numeric suffix.
-        $index = 0
-        $stem = [IO.Path]::GetFileNameWithoutExtension($name)
-        do {
-            $suffix = if ($index -eq 0) { '' } else { "_$index" }
-            $output = Join-Path $desktop "$stem$suffix.pdf"
-            $index++
-        } while ($outputs -contains $output)
-        $outputs += $output
-        $item = $folder.ParseName($name)
-        $verbs = $item.Verbs()
-        $menu = $null
-        for ($v = 0; $v -lt $verbs.Count; $v++) {
-            $verb = $verbs.Item($v)
-            if ($verb.Name.Replace('&', '').Trim() -ceq 'Convert to PDF') { $menu = $verb; break }
-            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($verb)
-        }
-        Assert-True ($null -ne $menu) "Explorer exposes menu for $extension"
-        try { $menu.DoIt() }
-        finally {
-            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($menu)
-            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($verbs)
-            [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($item)
-        }
-        $timer = [Diagnostics.Stopwatch]::StartNew()
-        while (!(Test-Path -LiteralPath $output) -and $timer.Elapsed.TotalSeconds -lt 200) { Start-Sleep -Milliseconds 250 }
-        Assert-True (Test-Path -LiteralPath $output) "Shell verb generated Desktop PDF for $extension"
-        $stream = [IO.File]::OpenRead($output)
-        try {
-            $header = New-Object byte[] 5
-            [void]$stream.Read($header, 0, 5)
-            Assert-True ([Text.Encoding]::ASCII.GetString($header) -ceq '%PDF-') 'PDF header'
-        }
-        finally { $stream.Dispose() }
-        Write-Output "PASS: actual Shell context-menu invocation $extension -> Desktop PDF"
-    }
-    # Uninstall must not delete adjacent verbs or depend on the EXE still existing.
     $sentinel = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($sentinelPath)
-    $sentinel.SetValue('', 'Unrelated test verb')
-    $sentinel.Dispose()
+    try { $sentinel.SetValue('', 'unrelated') } finally { $sentinel.Dispose() }
     & "$PSScriptRoot\Uninstall-ContextMenu.ps1"
     & "$PSScriptRoot\Uninstall-ContextMenu.ps1"
-    foreach ($path in $backups.Keys) {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($path)
-        try { Assert-True ($null -eq $key) 'uninstalled all seven verbs' }
-        finally { if ($null -ne $key) { $key.Dispose() } }
+    Assert-True (@(Get-OwnedMenuPackages).Count -eq 0) 'package removed'
+    Assert-True ((Get-MenuSettings).Count -eq 0) 'configuration removed'
+    Assert-True (!(Test-Path -LiteralPath $script:PayloadRoot)) 'all owned installed payloads removed'
+    foreach ($extension in $extensions) {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Software\Classes\SystemFileAssociations\$extension\shell\FileToPDF.ConvertToPdf")
+        try { Assert-True ($null -eq $key) 'owned verb removed' } finally { if ($key) { $key.Dispose() } }
     }
     $sentinel = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($sentinelPath)
-    try { Assert-True ($sentinel.GetValue('') -ceq 'Unrelated test verb') 'unrelated verb preserved' }
-    finally { $sentinel.Dispose() }
-    Write-Output 'PASS: idempotent install/uninstall, missing EXE rejection, quoting, unrelated registry preservation'
-}
-finally {
-    foreach ($path in $backups.Keys) {
-        [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($path, $false)
-        if ($null -ne $backups[$path]) {
-            $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($path)
-            try { Write-Key $key $backups[$path] } finally { $key.Dispose() }
-        }
-    }
+    try { Assert-True ($sentinel.GetValue('') -ceq 'unrelated') 'other menu unchanged' } finally { $sentinel.Dispose() }
+    Write-Output 'PASS: Win10 registry mechanism, idempotent uninstall, package/registry/payload cleanup, unrelated menu preserved'
+} finally {
     [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($sentinelPath, $false)
-    if ($null -ne $shell) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) }
     foreach ($output in $outputs) { if (Test-Path -LiteralPath $output) { Remove-Item -LiteralPath $output } }
-    if ($null -ne ('FileToPDF.ContextMenuNotification' -as [type])) {
-        [FileToPDF.ContextMenuNotification]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
-    }
+    if ($previous['ExePath']) {
+        & "$PSScriptRoot\Install-ContextMenu.ps1" -ExePath $previous['ExePath'] -Mode $previous['Mode']
+    } else { & "$PSScriptRoot\Uninstall-ContextMenu.ps1" }
 }

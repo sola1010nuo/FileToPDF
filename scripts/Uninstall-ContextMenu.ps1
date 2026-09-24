@@ -1,31 +1,23 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 [CmdletBinding(SupportsShouldProcess = $true)]
 param()
-
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-
-foreach ($extension in @('.doc', '.docx', '.ppt', '.pptx', '.jpg', '.jpeg', '.png')) {
-    # Delete only our named verb. Leave extension associations and other applications intact.
-    $path = "Software\Classes\SystemFileAssociations\$extension\shell\FileToPDF.ConvertToPdf"
-    if ($PSCmdlet.ShouldProcess("HKCU\$path", 'Remove Convert to PDF')) {
-        [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($path, $false)
+. "$PSScriptRoot\ContextMenu.Common.ps1"
+if (!$PSCmdlet.ShouldProcess('FileToPDF context menu for current user', 'Remove package, owned registration and integration payloads')) { return }
+$settings = Get-MenuSettings
+foreach ($package in @(Get-OwnedMenuPackages)) { Remove-AppxPackage -Package $package.PackageFullName }
+Remove-MenuVerbs
+foreach ($thumbprint in @($settings['TrustedThumbprints'])) {
+    if ($thumbprint -match '^[A-Fa-f0-9]{40}$') {
+        $path = "Cert:\LocalMachine\TrustedPeople\$thumbprint"
+        if (Test-Path -LiteralPath $path) {
+            if (!(Set-MenuDevelopmentTrust 'Remove' $thumbprint)) { Write-Output 'Kept a shared or pre-existing signing certificate.' }
+        }
     }
 }
-
-if (!$WhatIfPreference) {
-    if ($null -eq ('FileToPDF.ContextMenuNotification' -as [type])) {
-        Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-namespace FileToPDF {
-    public static class ContextMenuNotification {
-        [DllImport("shell32.dll")]
-        public static extern void SHChangeNotify(uint eventId, uint flags, IntPtr item1, IntPtr item2);
-    }
-}
-'@
-    }
-    [FileToPDF.ContextMenuNotification]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
-    Write-Output 'Removed Convert to PDF for the current user. FileToPDF.exe and existing PDFs were not removed.'
-}
+[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($script:SettingsPath, $false)
+Send-MenuChanged
+try { Remove-MenuPayloads }
+catch { throw "Registration was removed, but Windows still holds a payload file. Sign out/in and rerun uninstall to finish cleanup. Details: $_" }
+Write-Output 'Removed FileToPDF integration. The converter EXE, PDFs and other applications were not changed.'
